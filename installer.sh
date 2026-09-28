@@ -20,12 +20,55 @@ exec 3>&1
 
 die() {
     local msg=${1:-"Unknown error"}
-    dialog --msgbox "$msg\n\nSee log: $LOG" 10 72 || true
+    dialog --msgbox "$msg\n\nSee log: $LOG" 14 76 || true
     exit 1
 }
 
 run() {
-    "$@" >>"$LOG" 2>&1 || die "Command failed: $*"
+    local out rc=0
+    out=$(mktemp)
+    "$@" >"$out" 2>&1 || rc=$?
+    cat "$out" >>"$LOG"
+    if ((rc != 0)); then
+        local tail_output
+        tail_output=$(tail -n 20 "$out")
+        rm -f "$out"
+        die "Command failed (exit $rc): $*\n\n--- last output ---\n${tail_output:-(no output; re-run this command by hand and check: echo $?)}"
+    fi
+    rm -f "$out"
+}
+
+fetch_file() {
+    local url=$1 dest=$2
+    if command -v curl >/dev/null 2>&1; then
+        run curl -fsSL -o "$dest" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        run wget -O "$dest" "$url"
+    else
+        die "Neither curl nor wget is available on the live system."
+    fi
+}
+
+mount_chroot_fs() {
+    local d
+    for d in dev proc sys; do
+        run mkdir -p "$TARGET/$d"
+        mountpoint -q "$TARGET/$d" || run mount --rbind "/$d" "$TARGET/$d"
+        run mount --make-rslave "$TARGET/$d"
+    done
+}
+
+umount_chroot_fs() {
+    local d
+    for d in dev proc sys; do
+        umount -R "$TARGET/$d" >>"$LOG" 2>&1 || true
+    done
+}
+
+# Run a chroot command interactively (prompts must be visible), no capture.
+chroot_interactive() {
+    clear
+    chroot "$TARGET" "$@" || die "Command failed: chroot $TARGET $*"
 }
 
 msgbox() {
@@ -38,7 +81,7 @@ require_root() {
 
 require_tools() {
     local missing=()
-    local tools=(dialog xbps-install lsblk findmnt mkfs.btrfs mkfs.vfat mkswap swapon mount umount grub-install chroot)
+    local tools=(dialog xbps-install lsblk findmnt mkfs.btrfs mkfs.vfat mkswap swapon mount umount chroot parted wipefs btrfs blkid)
     local t
     for t in "${tools[@]}"; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
@@ -150,18 +193,22 @@ network_step() {
 }
 
 pick_disk() {
-    local disks=()
-    local line
-    while read -r line; do
-        local name size model
-        name=$(awk '{print $1}' <<<"$line")
-        size=$(awk '{print $2}' <<<"$line")
-        model=$(cut -d' ' -f3- <<<"$line")
-        disks+=("/dev/$name" "$size $model")
-    done < <(lsblk -dpno NAME,SIZE,MODEL,TYPE | awk '$4=="disk"{print $1" "$2" "$3" "$4}' | sed 's#/dev/##')
+    local options=()
+    local name size model type
 
-    ((${#disks[@]} > 0)) || die "No disks detected."
-    DISK=$(dialog --stdout --menu "Select target disk" 20 80 10 "${disks[@]}") || exit 1
+    while read -r name size type model; do
+        [[ $type == disk ]] || continue
+        [[ $name == *loop* || $name == *sr0* ]] && continue
+        options+=("$name" "${size} ${model:-disk}")
+    done < <(lsblk -dnp -o NAME,SIZE,TYPE,MODEL | tail -n +2)
+
+    ((${#options[@]} > 0)) || die "No installation disks found."
+    DISK=$(dialog --stdout --menu "Select installation disk" 18 76 10 "${options[@]}") || exit 1
+
+    PART_PREFIX=
+    if [[ $DISK == *nvme* || $DISK == *mmcblk* || $DISK == *loop* ]]; then
+        PART_PREFIX=p
+    fi
 }
 
 auto_partition_btrfs() {
@@ -172,7 +219,13 @@ auto_partition_btrfs() {
 
     dialog --yesno "This will ERASE all data on $DISK. Continue?" 10 70 || exit 1
 
-    run umount -R "$TARGET" || true
+    if findmnt -rn -M "$TARGET" >/dev/null 2>&1; then
+        run umount -R "$TARGET"
+    fi
+    swapoff -a >>"$LOG" 2>&1 || true
+    for part in $(lsblk -lnp -o NAME "$DISK" | tail -n +2); do
+        umount -R "$part" >>"$LOG" 2>&1 || true
+    done
     run wipefs -a "$DISK"
     run parted -s "$DISK" mklabel gpt
     run parted -s "$DISK" mkpart ESP fat32 1MiB 551MiB
@@ -273,18 +326,60 @@ select_xlibre() {
     fi
 }
 
-install_base() {
-    run mkdir -p "$TARGET"
-    run cp /etc/resolv.conf "$TARGET/etc/resolv.conf"
-
-    local pkgs=(base-system linux linux-firmware grub efibootmgr dialog sudo)
+gen_fstab() {
+    local out="$TARGET/etc/fstab"
+    : >"$out"
+    local src tgt fstype opts uuid
+    while read -r src tgt fstype opts; do
+        [[ $tgt == "$TARGET" || $tgt == "$TARGET"/* ]] || continue
+        uuid=$(blkid -s UUID -o value "${src%%[*}") || continue
+        tgt=${tgt#"$TARGET"}
+        [[ -n $tgt ]] || tgt=/
+        local pass=0
+        [[ $tgt == / ]] && pass=1
+        printf 'UUID=%s %s %s %s 0 %s\n' "$uuid" "$tgt" "$fstype" "$opts" "$pass" >>"$out"
+    done < <(findmnt -Rrn -o SOURCE,TARGET,FSTYPE,OPTIONS "$TARGET")
     if [[ -n ${SWAP_PART:-} ]]; then
-        pkgs+=(util-linux)
+        printf 'UUID=%s none swap defaults 0 0\n' "$(blkid -s UUID -o value "$SWAP_PART")" >>"$out"
+    fi
+    printf 'tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0\n' >>"$out"
+}
+
+install_base() {
+    run mkdir -p "$TARGET/etc" "$TARGET/var/db/xbps/keys"
+
+    # resolv.conf may be a symlink on the live ISO; copy the real content.
+    run rm -f "$TARGET/etc/resolv.conf"
+    cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf" 2>>"$LOG" || true
+    if [[ ! -s "$TARGET/etc/resolv.conf" ]]; then
+        printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' >"$TARGET/etc/resolv.conf"
     fi
 
+    # The live ISO's xbps is often outdated, and xbps refuses every other
+    # transaction until it is updated. Update it first (also syncs repos).
+    run xbps-install -Syu xbps
+
+    # With `-r $TARGET`, xbps reads its repo config from $TARGET/etc/xbps.d,
+    # NOT from the live ISO. If that is empty xbps has no repositories and
+    # silently installs nothing. Copy the live system's repo config over.
+    run mkdir -p "$TARGET/etc/xbps.d"
+    local f
+    for f in /usr/share/xbps.d/*.conf /etc/xbps.d/*.conf; do
+        [[ -f $f ]] && cp -L "$f" "$TARGET/etc/xbps.d/" 2>>"$LOG"
+    done
+    if ! grep -qsh '^repository=' "$TARGET"/etc/xbps.d/*.conf; then
+        echo 'repository=https://repo-default.voidlinux.org/current' >"$TARGET/etc/xbps.d/00-repository-main.conf"
+    fi
+
+    # Reuse the live system's trusted repo keys for the new root.
+    cp -a /var/db/xbps/keys/. "$TARGET/var/db/xbps/keys/" 2>>"$LOG" || true
+
+    local pkgs=(base-system linux linux-firmware grub efibootmgr dialog sudo)
+    pkgs+=(grub-x86_64-efi btrfs-progs dhcpcd)
+
     run xbps-install -Sy -r "$TARGET" "${pkgs[@]}"
+    gen_fstab
     run xbps-reconfigure -r "$TARGET" -fa
-    run xgenfstab -U "$TARGET" >"$TARGET/etc/fstab"
 }
 
 configure_system() {
@@ -314,8 +409,9 @@ EOF
 
 install_optional_components() {
     if [[ $INSTALL_XLIBRE == yes ]]; then
-        run chroot "$TARGET" mkdir -p /var/db/xbps/keys
-        run chroot "$TARGET" wget -O /var/db/xbps/keys/00:ca:42:57:c9:c0:9a:ec:94:b4:7d:97:e5:a9:aa:1e.plist https://github.com/xlibre-void/xlibre/raw/refs/heads/main/repo-keys/x86_64/00:ca:42:57:c9:c0:9a:ec:94:b4:7d:97:e5:a9:aa:1e.plist
+        run mkdir -p "$TARGET/var/db/xbps/keys"
+        fetch_file "https://github.com/xlibre-void/xlibre/raw/refs/heads/main/repo-keys/x86_64/00:ca:42:57:c9:c0:9a:ec:94:b4:7d:97:e5:a9:aa:1e.plist" \
+            "$TARGET/var/db/xbps/keys/00:ca:42:57:c9:c0:9a:ec:94:b4:7d:97:e5:a9:aa:1e.plist"
         run chroot "$TARGET" mkdir -p /etc/xbps.d
         cat >"$TARGET/etc/xbps.d/99-repository-xlibre.conf" <<EOF
 repository=https://github.com/xlibre-void/xlibre/releases/latest/download
@@ -365,7 +461,7 @@ setup_bootloader() {
 
 set_passwords_and_users() {
     msgbox "Set root password in the next prompt." 7 55
-    run chroot "$TARGET" passwd
+    chroot_interactive passwd
 
     if dialog --yesno "Create a regular user?" 8 50; then
         local user
@@ -373,13 +469,14 @@ set_passwords_and_users() {
         [[ -n $user ]] || die "Username cannot be empty."
         run chroot "$TARGET" useradd -m -G wheel,audio,video,input "$user"
         msgbox "Set password for user '$user' in the next prompt." 8 60
-        run chroot "$TARGET" passwd "$user"
+        chroot_interactive passwd "$user"
         run chroot "$TARGET" sh -c "echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel"
         run chroot "$TARGET" chmod 440 /etc/sudoers.d/10-wheel
     fi
 }
 
 finalize() {
+    umount_chroot_fs
     msgbox "Installation complete.\n\nYou can reboot after reviewing $LOG." 10 70
 }
 
@@ -404,6 +501,7 @@ main() {
     main_menu_summary
 
     install_base
+    mount_chroot_fs
     configure_system
     install_optional_components
     setup_bootloader
