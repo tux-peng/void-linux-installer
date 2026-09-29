@@ -15,6 +15,7 @@ SWAP_PART=
 DISK=
 DESKTOP=
 INSTALL_XLIBRE=no
+XSERVER_PKG=xorg   # becomes xlibre when the XLibre repo is enabled
 
 exec 3>&1
 
@@ -38,15 +39,31 @@ run() {
     rm -f "$out"
 }
 
+# Like run(), but streams live output in a dialog box so long operations
+# (package installs) visibly make progress instead of looking frozen.
+run_progress() {
+    local title=$1; shift
+    local out rcfile rc
+    out=$(mktemp)
+    rcfile=$(mktemp)
+    {
+        "$@" 2>&1 && echo 0 >"$rcfile" || echo $? >"$rcfile"
+    } | tr '\r' '\n' | tee "$out" | dialog --title "$title" --progressbox "Running: $*" 20 78 || true
+    rc=$(cat "$rcfile" 2>/dev/null || echo 1)
+    cat "$out" >>"$LOG"
+    if ((rc != 0)); then
+        local tail_output
+        tail_output=$(tail -n 20 "$out")
+        rm -f "$out" "$rcfile"
+        die "Command failed (exit $rc): $*\n\n--- last output ---\n${tail_output:-(no output)}"
+    fi
+    rm -f "$out" "$rcfile"
+}
+
 fetch_file() {
     local url=$1 dest=$2
-    if command -v curl >/dev/null 2>&1; then
-        run curl -fsSL -o "$dest" "$url"
-    elif command -v wget >/dev/null 2>&1; then
-        run wget -O "$dest" "$url"
-    else
-        die "Neither curl nor wget is available on the live system."
-    fi
+    # curl is broken in the current Void live image; wget is required.
+    run wget -q -O "$dest" "$url"
 }
 
 mount_chroot_fs() {
@@ -77,6 +94,15 @@ msgbox() {
 
 require_root() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root."
+}
+
+# curl is broken in the current Void live image, so update xbps and install
+# wget (used for downloads) and parted (used for partitioning) up front.
+# Output goes straight to the terminal so it's clear the script isn't frozen.
+bootstrap_live_tools() {
+    echo "==> Updating xbps and installing wget + parted on the live system..."
+    xbps-install -Syu xbps || die "Failed to update xbps on the live system."
+    xbps-install -Sy parted wget || die "Failed to install parted and wget."
 }
 
 require_tools() {
@@ -321,8 +347,10 @@ select_desktop() {
 select_xlibre() {
     if dialog --yesno "Install XLibre repository configuration?" 9 60; then
         INSTALL_XLIBRE=yes
+        XSERVER_PKG=xlibre
     else
         INSTALL_XLIBRE=no
+        XSERVER_PKG=xorg
     fi
 }
 
@@ -357,7 +385,7 @@ install_base() {
 
     # The live ISO's xbps is often outdated, and xbps refuses every other
     # transaction until it is updated. Update it first (also syncs repos).
-    run xbps-install -Syu xbps
+    run_progress "Updating xbps" xbps-install -Syu xbps
 
     # With `-r $TARGET`, xbps reads its repo config from $TARGET/etc/xbps.d,
     # NOT from the live ISO. If that is empty xbps has no repositories and
@@ -377,9 +405,9 @@ install_base() {
     local pkgs=(base-system linux linux-firmware grub efibootmgr dialog sudo)
     pkgs+=(grub-x86_64-efi btrfs-progs dhcpcd)
 
-    run xbps-install -Sy -r "$TARGET" "${pkgs[@]}"
+    run_progress "Installing base system (this can take a while)" xbps-install -Sy -r "$TARGET" "${pkgs[@]}"
     gen_fstab
-    run xbps-reconfigure -r "$TARGET" -fa
+    run_progress "Configuring installed packages" xbps-reconfigure -r "$TARGET" -fa
 }
 
 configure_system() {
@@ -404,7 +432,7 @@ EOF
         run ln -sf /etc/sv/dhcpcd "$TARGET/etc/runit/runsvdir/default/"
     fi
 
-    run chroot "$TARGET" xbps-reconfigure -f glibc-locales
+    run_progress "Generating locales" chroot "$TARGET" xbps-reconfigure -f glibc-locales
 }
 
 install_optional_components() {
@@ -416,21 +444,21 @@ install_optional_components() {
         cat >"$TARGET/etc/xbps.d/99-repository-xlibre.conf" <<EOF
 repository=https://github.com/xlibre-void/xlibre/releases/latest/download
 EOF
-        run chroot "$TARGET" xbps-install -Sy
+        run_progress "Syncing XLibre repository" chroot "$TARGET" xbps-install -Sy
     fi
 
     case "$DESKTOP" in
         mate)
-            run chroot "$TARGET" xbps-install -Sy xorg mate mate-extra lightdm lightdm-gtk3-greeter octoxbps
+            run_progress "Installing desktop (this can take a while)" chroot "$TARGET" xbps-install -Sy "$XSERVER_PKG" mate mate-extra lightdm lightdm-gtk3-greeter octoxbps
             ;;
         xfce)
-            run chroot "$TARGET" xbps-install -Sy xorg xfce4 xfce4-goodies lightdm lightdm-gtk3-greeter octoxbps
+            run_progress "Installing desktop (this can take a while)" chroot "$TARGET" xbps-install -Sy "$XSERVER_PKG" xfce4 xfce4-goodies lightdm lightdm-gtk3-greeter octoxbps
             ;;
         lxqt)
-            run chroot "$TARGET" xbps-install -Sy xorg lxqt sddm octoxbps
+            run_progress "Installing desktop (this can take a while)" chroot "$TARGET" xbps-install -Sy "$XSERVER_PKG" lxqt sddm octoxbps
             ;;
         cinnamon)
-            run chroot "$TARGET" xbps-install -Sy xorg cinnamon lightdm lightdm-gtk3-greeter octoxbps
+            run_progress "Installing desktop (this can take a while)" chroot "$TARGET" xbps-install -Sy "$XSERVER_PKG" cinnamon lightdm lightdm-gtk3-greeter octoxbps
             ;;
         none)
             ;;
@@ -486,6 +514,7 @@ main_menu_summary() {
 
 main() {
     require_root
+    bootstrap_live_tools
     require_tools
     init_log
     confirm_start
