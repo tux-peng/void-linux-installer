@@ -336,12 +336,14 @@ disk_setup() {
 }
 
 select_desktop() {
-    DESKTOP=$(dialog --stdout --menu "Optional desktop environment" 16 72 7 \
+    DESKTOP=$(dialog --stdout --menu "Optional desktop environment" 18 72 8 \
         "none" "No desktop install" \
         "mate" "MATE desktop" \
         "xfce" "Xfce desktop" \
         "lxqt" "LXQt desktop" \
-        "cinnamon" "Cinnamon desktop") || exit 1
+        "cinnamon" "Cinnamon desktop" \
+        "kde" "KDE Plasma desktop" \
+        "sonicde" "SonicDE (Plasma 6 X11 fork, third-party repo)") || exit 1
 }
 
 select_xlibre() {
@@ -459,6 +461,19 @@ EOF
             ;;
         cinnamon)
             run_progress "Installing desktop (this can take a while)" chroot "$TARGET" xbps-install -Sy "$XSERVER_PKG" cinnamon lightdm lightdm-gtk3-greeter octoxbps
+            ;;
+        kde)
+            run_progress "Installing desktop (this can take a while)" chroot "$TARGET" xbps-install -Sy "$XSERVER_PKG" kde-plasma kde-baseapps sddm octoxbps
+            ;;
+        sonicde)
+            # SonicDE is not in the official Void repos: add its repository
+            # inside the target (xbps.d dir, repo config), then sync. -y
+            # auto-accepts the repository key fingerprint.
+            run mkdir -p "$TARGET/etc/xbps.d"
+            printf 'repository=https://github.com/sonicde-void/sonicde-void/releases/latest/download/\n' \
+                >"$TARGET/etc/xbps.d/99-repository-sonicde.conf"
+            run_progress "Syncing SonicDE repository" chroot "$TARGET" xbps-install -Sy
+            run_progress "Installing SonicDE (this can take a while)" chroot "$TARGET" xbps-install -Sy "$XSERVER_PKG" sonicde-meta sddm octoxbps
             ;;
         none)
             ;;
